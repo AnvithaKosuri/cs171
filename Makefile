@@ -25,5 +25,5 @@ all:
 	@osascript -e 'tell application "Terminal" to do script "cd \"$(PROJECT_DIR)\"; $(PYTHON) node.py 5"'
 
 clean:
-	rm -f blockchain_*.json balances_*.json
+	rm -f blockchain_*.json balances_*.json paxos_state_*.json
 	@echo "Cleaned all persistent files."

@@ -1,6 +1,6 @@
 import hashlib
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 
 @dataclass
@@ -87,7 +87,7 @@ class Block:
 
 
 class Blockchain:
-    def __init__(self, blocks: List[Block] | None = None):
+    def __init__(self, blocks: Optional[List[Block]] = None):
         self.blocks: List[Block] = blocks or []
 
     def to_dict(self) -> Dict[str, Any]:
