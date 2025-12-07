@@ -1,95 +1,94 @@
 import json
 import os
-from typing import Dict, Any
-
-from blockchain import Blockchain, Block, Transaction
-
-
-def balances_filename(node_id: int) -> str:
-    return f"balances_{node_id}.json"
+from typing import Dict, Any, Set, Optional
+from blockchain import Blockchain, Block
 
 
-def blockchain_filename(node_id: int) -> str:
-    return f"blockchain_{node_id}.json"
+def _filename(node_id: int, prefix: str) -> str:
+    return f"{prefix}_{node_id}.json"
 
 
-def init_balances_if_missing(node_id: int, num_nodes: int, initial_balance: int = 100) -> None:
-    """
-    Initialize balances file if it does not already exist.
-    Each node starts with the same initial balance.
-    If the file exists but has fewer accounts than num_nodes, it is expanded.
-    """
-    fname = balances_filename(node_id)
-    balances: Dict[str, int] = {}
-    if os.path.exists(fname):
-        with open(fname, "r", encoding="utf-8") as f:
-            try:
-                balances = json.load(f)
-            except Exception:
-                balances = {}
+def _load_json(fname: str) -> Optional[Dict]:
+    if not os.path.exists(fname):
+        return None
+    try:
+        with open(fname, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-    changed = False
+
+def _save_json(fname: str, data: Dict) -> None:
+    with open(fname, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ============ Balances ============
+
+def init_balances(node_id: int, num_nodes: int, initial: int = 100) -> None:
+    fname = _filename(node_id, "balances")
+    balances = _load_json(fname) or {}
     for i in range(1, num_nodes + 1):
-        key = str(i)
-        if key not in balances:
-            balances[key] = initial_balance
-            changed = True
-
-    if not os.path.exists(fname) or changed:
-        with open(fname, "w", encoding="utf-8") as f:
-            json.dump(balances, f, indent=2)
+        balances.setdefault(str(i), initial)
+    _save_json(fname, balances)
 
 
 def load_balances(node_id: int) -> Dict[str, int]:
-    fname = balances_filename(node_id)
-    if not os.path.exists(fname):
-        raise FileNotFoundError(f"Balances file {fname} not found.")
-    with open(fname, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_json(_filename(node_id, "balances")) or {}
 
 
 def save_balances(node_id: int, balances: Dict[str, int]) -> None:
-    fname = balances_filename(node_id)
-    with open(fname, "w", encoding="utf-8") as f:
-        json.dump(balances, f, indent=2)
+    _save_json(_filename(node_id, "balances"), balances)
 
 
-def init_blockchain_if_missing(node_id: int) -> None:
-    fname = blockchain_filename(node_id)
-    if os.path.exists(fname):
-        return
-    bc = Blockchain([])
-    with open(fname, "w", encoding="utf-8") as f:
-        json.dump(bc.to_dict(), f, indent=2)
+# ============ Blockchain ============
+
+def init_blockchain(node_id: int) -> None:
+    fname = _filename(node_id, "blockchain")
+    if not os.path.exists(fname):
+        _save_json(fname, {"blocks": []})
 
 
 def load_blockchain(node_id: int) -> Blockchain:
-    fname = blockchain_filename(node_id)
+    data = _load_json(_filename(node_id, "blockchain"))
+    return Blockchain.from_dict(data) if data else Blockchain()
+
+
+def save_blockchain(node_id: int, bc: Blockchain) -> None:
+    _save_json(_filename(node_id, "blockchain"), bc.to_dict())
+
+
+# ============ Paxos State ============
+
+def init_paxos_state(node_id: int) -> None:
+    fname = _filename(node_id, "paxos_state")
     if not os.path.exists(fname):
-        raise FileNotFoundError(f"Blockchain file {fname} not found.")
-    with open(fname, "r", encoding="utf-8") as f:
-        data: Any = json.load(f)
-    return Blockchain.from_dict(data)
+        _save_json(fname, {"paxos_states": {}, "decided_depths": [], "proposal_seq": 0})
 
 
-def save_blockchain(node_id: int, blockchain: Blockchain) -> None:
-    fname = blockchain_filename(node_id)
-    with open(fname, "w", encoding="utf-8") as f:
-        json.dump(blockchain.to_dict(), f, indent=2)
+def load_paxos_state(node_id: int) -> Optional[Dict]:
+    return _load_json(_filename(node_id, "paxos_state"))
 
 
-def apply_decided_block_to_balances(block: Block, balances: Dict[str, int]) -> None:
-    """
-    Apply the money transfer in a decided block to the balances map.
-    Assumes balances keys are node ids as strings.
-    """
+def save_paxos_state(node_id: int, paxos_states: Dict, decided: Set[int], seq: int) -> None:
+    serialized = {}
+    for depth, st in paxos_states.items():
+        serialized[str(depth)] = {
+            "promised_n": list(st.promised_n) if st.promised_n else None,
+            "accepted_n": list(st.accepted_n) if st.accepted_n else None,
+            "accepted_block": st.accepted_block.to_dict() if st.accepted_block else None,
+        }
+    _save_json(_filename(node_id, "paxos_state"), {
+        "paxos_states": serialized, "decided_depths": list(decided), "proposal_seq": seq
+    })
+
+
+# ============ Helpers ============
+
+def apply_block(block: Block, balances: Dict[str, int]) -> None:
+    """Apply a decided block's transaction to balances."""
     tx = block.transaction
-    s = str(tx.sender_id)
-    r = str(tx.receiver_id)
-    amt = tx.amount
-
-    if s not in balances or r not in balances:
-        return
-
-    balances[s] -= amt
-    balances[r] += amt
+    s, r = str(tx.sender_id), str(tx.receiver_id)
+    if s in balances and r in balances:
+        balances[s] -= tx.amount
+        balances[r] += tx.amount

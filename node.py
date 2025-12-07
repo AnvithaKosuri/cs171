@@ -3,447 +3,481 @@ import socket
 import threading
 import time
 import sys
+import random
 from typing import Dict, Any, Tuple, Optional, List, Set
 
 from blockchain import Blockchain, Block, Transaction
 from storage import (
-    init_balances_if_missing,
-    init_blockchain_if_missing,
-    load_balances,
-    save_balances,
-    load_blockchain,
-    save_blockchain,
-    apply_decided_block_to_balances,
+    init_balances, load_balances, save_balances,
+    init_blockchain, load_blockchain, save_blockchain,
+    init_paxos_state, load_paxos_state, save_paxos_state, apply_block,
 )
-from paxos import PaxosState, compare_ballot
-
 
 CONFIG_FILE = "config.json"
+Ballot = Tuple[int, int, int]  # (seq_num, proc_id, depth)
+
+
+class PaxosState:
+    """Per-depth Paxos acceptor state."""
+    def __init__(self):
+        self.promised_n: Optional[Ballot] = None
+        self.accepted_n: Optional[Ballot] = None
+        self.accepted_block: Optional[Block] = None
 
 
 class Node:
-    """
-    A single blockchain node that participates in Paxos for each block depth.
-    It acts as proposer, acceptor, and learner.
-    """
+    """Blockchain node participating in Paxos consensus."""
 
-    def __init__(self, node_id: int, config_path: str = CONFIG_FILE) -> None:
-        self.node_id = node_id
-        self.config_path = config_path
-
-        # Load configuration
-        with open(self.config_path, "r", encoding="utf-8") as f:
+    def __init__(self, node_id: int):
+        self.id = node_id
+        
+        # Load config
+        with open(CONFIG_FILE) as f:
             cfg = json.load(f)
-        self.nodes: List[Dict[str, Any]] = cfg["nodes"]
-        self.delay: float = cfg.get("message_delay_sec", 0.0)
+        self.nodes = cfg["nodes"]
+        self.delay = cfg.get("message_delay_sec", 0.0)
+        self.me = next(n for n in self.nodes if n["id"] == self.id)
+        self.majority = len(self.nodes) // 2 + 1
 
-        self.me = next(n for n in self.nodes if n["id"] == self.node_id)
-        self.num_nodes = len(self.nodes)
-        self.majority = self.num_nodes // 2 + 1
-
-        # Persistent state
-        init_balances_if_missing(self.node_id, self.num_nodes)
-        init_blockchain_if_missing(self.node_id)
-        self.balances: Dict[str, int] = load_balances(self.node_id)
-        self.blockchain: Blockchain = load_blockchain(self.node_id)
+        # Initialize persistent state
+        init_balances(self.id, len(self.nodes))
+        init_blockchain(self.id)
+        init_paxos_state(self.id)
+        
+        self.balances = load_balances(self.id)
+        self.blockchain = load_blockchain(self.id)
 
         # Paxos state
-        self.paxos_states: Dict[int, PaxosState] = {}  # depth -> PaxosState
-        self.accepted_counts: Dict[Tuple[int, Tuple[int, int, int]], int] = {}
-        self.current_ballot: Dict[int, Tuple[int, int, int]] = {}
-        self.proposed_blocks: Dict[int, Block] = {}  # depth -> value we want
-        self.promises: Dict[int, Dict[int, Tuple[Optional[Tuple[int, int, int]], Optional[Block]]]] = {}
-        self.accept_phase_started: Set[int] = set()
-        self.decided_depths: Set[int] = set()
-        self.global_proposal_seq: int = 0
+        self.paxos: Dict[int, PaxosState] = {}  # depth -> state
+        self.decided: Set[int] = set()
+        self.proposal_seq = 0
+        self.current_ballot: Dict[int, Ballot] = {}
+        self.proposed_blocks: Dict[int, Block] = {}
+        self.promises: Dict[int, Dict[int, Tuple]] = {}
+        self.accepted_counts: Dict[Tuple, int] = {}
+        self.accept_started: Set[int] = set()
+        
+        # Recovery state
+        self.depth_responses: Dict[int, int] = {}
+        self.received_chains: Dict[int, Dict] = {}
+        self.awaiting_depths = False
+        self.syncing = False
+        
+        # Restore from disk
+        self._restore_state()
 
         # Networking
-        self.server_socket: Optional[socket.socket] = None
-        self.listener_thread: Optional[threading.Thread] = None
+        self.sock: Optional[socket.socket] = None
         self.running = True
-
-        # Lock for all mutable shared state
         self.lock = threading.Lock()
 
-        print(f"[Node {self.node_id}] Initialized. Listening on {self.me['host']}:{self.me['port']}")
+        print(f"[Node {self.id}] Started on {self.me['host']}:{self.me['port']}")
 
-    # ------------- Networking helpers -------------
+    # ==================== State Persistence ====================
 
-    def start_listener_thread(self) -> None:
-        """
-        Start background thread that listens for incoming TCP connections.
-        Each connection carries a single JSON message.
-        """
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.me["host"], self.me["port"]))
-        self.server_socket.listen()
+    def _restore_state(self):
+        saved = load_paxos_state(self.id)
+        if not saved:
+            return
+        self.decided = set(saved.get("decided_depths", []))
+        self.proposal_seq = saved.get("proposal_seq", 0)
+        for d_str, st in saved.get("paxos_states", {}).items():
+            d = int(d_str)
+            ps = PaxosState()
+            if st.get("promised_n"):
+                ps.promised_n = tuple(st["promised_n"])
+            if st.get("accepted_n"):
+                ps.accepted_n = tuple(st["accepted_n"])
+            if st.get("accepted_block"):
+                ps.accepted_block = Block.from_dict(st["accepted_block"])
+            self.paxos[d] = ps
+        print(f"[Node {self.id}] Restored: decided={self.decided}, seq={self.proposal_seq}")
 
-        def _listen() -> None:
-            print(f"[Node {self.node_id}] Listener started.")
-            while self.running:
-                try:
-                    client_sock, _ = self.server_socket.accept()
-                except OSError:
-                    break  # Socket closed
-                t = threading.Thread(target=self._handle_client, args=(client_sock,))
-                t.daemon = True
-                t.start()
-            print(f"[Node {self.node_id}] Listener thread exiting.")
+    def _save_state(self):
+        save_paxos_state(self.id, self.paxos, self.decided, self.proposal_seq)
 
-        self.listener_thread = threading.Thread(target=_listen, daemon=True)
-        self.listener_thread.start()
+    def _recompute_balances(self):
+        """Recompute balances from blockchain."""
+        self.balances = {str(i): 100 for i in range(1, len(self.nodes) + 1)}
+        for b in self.blockchain.blocks:
+            if not b.tentative:
+                apply_block(b, self.balances)
+        save_balances(self.id, self.balances)
 
-    def _handle_client(self, client_sock: socket.socket) -> None:
-        try:
-            data = client_sock.recv(65536)
-            if not data:
-                return
-            msg_str = data.decode("utf-8").strip()
-            if not msg_str:
-                return
+    # ==================== Networking ====================
+
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.me["host"], self.me["port"]))
+        self.sock.listen()
+        threading.Thread(target=self._listen, daemon=True).start()
+
+    def _listen(self):
+        while self.running:
             try:
-                msg = json.loads(msg_str)
-            except json.JSONDecodeError as e:
-                print(f"[Node {self.node_id}] Failed to decode JSON: {e}")
-                return
-            self.handle_message(msg)
-        finally:
-            try:
-                client_sock.close()
+                conn, _ = self.sock.accept()
+                threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
             except OSError:
-                pass
+                break
 
-    def send_to_node(self, target_id: int, msg: Dict[str, Any]) -> None:
-        """
-        Send a single JSON message to another node over TCP.
-        """
+    def _handle(self, conn: socket.socket):
+        try:
+            data = conn.recv(65536)
+            if data:
+                msg = json.loads(data.decode().strip())
+                self._dispatch(msg)
+        except:
+            pass
+        finally:
+            conn.close()
+
+    def send(self, target_id: int, msg: Dict):
         if self.delay > 0:
             time.sleep(self.delay)
-
         target = next((n for n in self.nodes if n["id"] == target_id), None)
-        if target is None:
-            print(f"[Node {self.node_id}] Unknown target id {target_id}")
+        if not target:
+            return
+        try:
+            with socket.create_connection((target["host"], target["port"]), timeout=2) as s:
+                s.sendall((json.dumps(msg) + "\n").encode())
+        except OSError as e:
+            print(f"[Node {self.id}] Send error to {target_id}: {e}")
+
+    def broadcast(self, msg: Dict):
+        for n in self.nodes:
+            self.send(n["id"], msg)
+
+    # ==================== Message Dispatch ====================
+
+    def _dispatch(self, msg: Dict):
+        handlers = {
+            "PREPARE": self._on_prepare, "PROMISE": self._on_promise,
+            "ACCEPT": self._on_accept, "ACCEPTED": self._on_accepted,
+            "DECIDE": self._on_decide, "SYNC_REQ": self._on_sync_req,
+            "SYNC_RESP": self._on_sync_resp, "DEPTH_REQ": self._on_depth_req,
+            "DEPTH_RESP": self._on_depth_resp,
+        }
+        handler = handlers.get(msg.get("type"))
+        if handler:
+            handler(msg)
+
+    # ==================== Paxos Protocol ====================
+
+    def _get_paxos(self, depth: int) -> PaxosState:
+        if depth not in self.paxos:
+            self.paxos[depth] = PaxosState()
+        return self.paxos[depth]
+
+    def _next_ballot(self, depth: int) -> Ballot:
+        self.proposal_seq += 1
+        self._save_state()
+        return (self.proposal_seq, self.id, depth)
+
+    def _on_prepare(self, msg: Dict):
+        depth, ballot, sender = msg["depth"], tuple(msg["ballot"]), msg["from"]
+        
+        with self.lock:
+            my_depth = self.blockchain.height()
+            
+            # Help stale proposers
+            if depth < my_depth:
+                print(f"[Node {self.id}] Stale PREPARE from {sender} (depth {depth} < {my_depth})")
+                self.send(sender, {"type": "SYNC_RESP", "from": self.id, 
+                                  "blockchain": self.blockchain.to_dict(), "depth": my_depth})
+            
+            ps = self._get_paxos(depth)
+            if ps.promised_n and ballot < ps.promised_n:
+                return  # Reject lower ballot
+            
+            ps.promised_n = ballot
+            self._save_state()
+            
+            resp = {"type": "PROMISE", "from": self.id, "depth": depth, 
+                   "ballot": list(ballot), "my_depth": my_depth}
+            if ps.accepted_n and ps.accepted_block:
+                resp["accepted_n"] = list(ps.accepted_n)
+                resp["accepted_block"] = ps.accepted_block.to_dict()
+        
+        self.send(sender, resp)
+
+    def _on_promise(self, msg: Dict):
+        depth, ballot, sender = msg["depth"], tuple(msg["ballot"]), msg["from"]
+        their_depth = msg.get("my_depth", depth)
+
+        with self.lock:
+            # Check if we're stale
+            if their_depth > self.blockchain.height():
+                self.send(sender, {"type": "SYNC_REQ", "from": self.id, 
+                                  "my_depth": self.blockchain.height()})
+
+            if self.current_ballot.get(depth) != ballot:
+                return
+            
+            proms = self.promises.setdefault(depth, {})
+            acc_n = tuple(msg["accepted_n"]) if "accepted_n" in msg else None
+            acc_blk = Block.from_dict(msg["accepted_block"]) if "accepted_block" in msg else None
+            proms[sender] = (acc_n, acc_blk)
+
+            if depth in self.accept_started or len(proms) < self.majority:
+                return
+
+            print(f"[Node {self.id}] Got majority promises for depth={depth}")
+            
+            # Choose value per Paxos rule
+            best_n, best_blk = None, None
+            for an, ab in proms.values():
+                if an and ab and (not best_n or an > best_n):
+                    best_n, best_blk = an, ab
+            
+            block = best_blk or self.proposed_blocks.get(depth)
+            if not block:
+                return
+
+            self.accept_started.add(depth)
+            acc_msg = {"type": "ACCEPT", "from": self.id, "depth": depth,
+                      "ballot": list(ballot), "block": block.to_dict()}
+
+        # Leader sync in background
+        threading.Thread(target=self._leader_sync, daemon=True).start()
+        self.broadcast(acc_msg)
+
+    def _on_accept(self, msg: Dict):
+        depth, ballot = msg["depth"], tuple(msg["ballot"])
+        block = Block.from_dict(msg["block"])
+
+        with self.lock:
+            ps = self._get_paxos(depth)
+            if ps.promised_n and ballot < ps.promised_n:
+                return
+            
+            ps.promised_n = ballot
+            ps.accepted_n = ballot
+            ps.accepted_block = block
+            self._save_state()
+
+        self.broadcast({"type": "ACCEPTED", "from": self.id, "depth": depth,
+                       "ballot": list(ballot), "block": block.to_dict()})
+
+    def _on_accepted(self, msg: Dict):
+        depth, ballot = msg["depth"], tuple(msg["ballot"])
+        key = (depth, ballot)
+
+        with self.lock:
+            self.accepted_counts[key] = self.accepted_counts.get(key, 0) + 1
+            
+            if ballot[1] != self.id or depth in self.decided:
+                return
+            if self.accepted_counts[key] < self.majority:
+                return
+
+            block = Block.from_dict(msg["block"])
+            print(f"[Node {self.id}] DECIDED depth={depth}")
+            self.decided.add(depth)
+            self._save_state()
+            self._commit(depth, block)
+
+        self.broadcast({"type": "DECIDE", "from": self.id, "depth": depth, 
+                       "block": block.to_dict()})
+
+    def _on_decide(self, msg: Dict):
+        depth, sender = msg["depth"], msg["from"]
+        block = Block.from_dict(msg["block"])
+        
+        with self.lock:
+            my_depth = self.blockchain.height()
+            if depth > my_depth:
+                print(f"[Node {self.id}] Stale! Need sync (decide depth={depth}, mine={my_depth})")
+                self.send(sender, {"type": "SYNC_REQ", "from": self.id, "my_depth": my_depth})
+                return
+
+            if depth in self.decided:
+                return
+            
+            print(f"[Node {self.id}] DECIDE received for depth={depth}")
+            self.decided.add(depth)
+            self._save_state()
+            self._commit(depth, block)
+
+    def _commit(self, depth: int, block: Block):
+        """Commit a decided block."""
+        block.tentative = False
+        self.blockchain.append_block(depth, block)
+        self._recompute_balances()
+        save_blockchain(self.id, self.blockchain)
+
+    # ==================== Recovery / Sync ====================
+
+    def _on_sync_req(self, msg: Dict):
+        sender, their_depth = msg["from"], msg.get("my_depth", 0)
+        my_depth = self.blockchain.height()
+        print(f"[Node {self.id}] SYNC_REQ from {sender} (theirs={their_depth}, mine={my_depth})")
+        if my_depth > their_depth:
+            self.send(sender, {"type": "SYNC_RESP", "from": self.id,
+                              "blockchain": self.blockchain.to_dict(), "depth": my_depth})
+
+    def _on_sync_resp(self, msg: Dict):
+        sender, their_depth = msg["from"], msg["depth"]
+        
+        with self.lock:
+            if their_depth <= self.blockchain.height():
+                return
+            
+            print(f"[Node {self.id}] Syncing from {sender} (depth {self.blockchain.height()} -> {their_depth})")
+            self.blockchain = Blockchain.from_dict(msg["blockchain"])
+            for i, b in enumerate(self.blockchain.blocks):
+                b.tentative = False
+                self.decided.add(i)
+            
+            self._recompute_balances()
+            save_blockchain(self.id, self.blockchain)
+            self._save_state()
+            print(f"[Node {self.id}] Sync complete! depth={self.blockchain.height()}")
+
+    def _on_depth_req(self, msg: Dict):
+        self.send(msg["from"], {"type": "DEPTH_RESP", "from": self.id,
+                               "depth": self.blockchain.height(),
+                               "blockchain": self.blockchain.to_dict()})
+
+    def _on_depth_resp(self, msg: Dict):
+        sender, depth = msg["from"], msg["depth"]
+        
+        with self.lock:
+            if not self.awaiting_depths:
+                return
+            self.depth_responses[sender] = depth
+            if "blockchain" in msg:
+                self.received_chains[sender] = msg["blockchain"]
+            
+            if len(self.depth_responses) >= self.majority:
+                self.awaiting_depths = False
+                self._sync_stale_nodes()
+
+    def _leader_sync(self):
+        """Leader collects depths and syncs stale nodes."""
+        with self.lock:
+            self.awaiting_depths = True
+            self.depth_responses = {}
+            self.received_chains = {}
+        self.broadcast({"type": "DEPTH_REQ", "from": self.id})
+
+    def _sync_stale_nodes(self):
+        """Send best blockchain to all stale nodes."""
+        self.depth_responses[self.id] = self.blockchain.height()
+        self.received_chains[self.id] = self.blockchain.to_dict()
+        
+        max_depth, best_id = 0, self.id
+        for nid, d in self.depth_responses.items():
+            if d > max_depth:
+                max_depth, best_id = d, nid
+        
+        best_chain = self.received_chains.get(best_id)
+        if not best_chain:
             return
 
-        host = target["host"]
-        port = target["port"]
-        try:
-            with socket.create_connection((host, port), timeout=2.0) as s:
-                s.sendall((json.dumps(msg) + "\n").encode("utf-8"))
-        except OSError as e:
-            print(f"[Node {self.node_id}] Error sending to node {target_id}: {e}")
+        # Update self if needed
+        if self.blockchain.height() < max_depth:
+            self.blockchain = Blockchain.from_dict(best_chain)
+            for i, b in enumerate(self.blockchain.blocks):
+                b.tentative = False
+                self.decided.add(i)
+            self._recompute_balances()
+            save_blockchain(self.id, self.blockchain)
+            self._save_state()
 
-    def broadcast(self, msg: Dict[str, Any]) -> None:
-        for n in self.nodes:
-            self.send_to_node(n["id"], msg)
+        # Update stale nodes
+        for nid, d in self.depth_responses.items():
+            if d < max_depth and nid != self.id:
+                print(f"[Node {self.id}] Syncing stale node {nid}")
+                self.send(nid, {"type": "SYNC_RESP", "from": self.id,
+                               "blockchain": best_chain, "depth": max_depth})
 
-    # ------------- Paxos helpers -------------
+    # ==================== Commands ====================
 
-    def get_paxos_state(self, depth: int) -> PaxosState:
-        st = self.paxos_states.get(depth)
-        if st is None:
-            st = PaxosState()
-            self.paxos_states[depth] = st
-        return st
-
-    def next_ballot(self, depth: int) -> Tuple[int, int, int]:
-        self.global_proposal_seq += 1
-        return (self.global_proposal_seq, self.node_id, depth)
-
-    # ------------- Command handling -------------
-
-    def command_loop(self) -> None:
-        print(
-            "Commands:\n"
-            "  moneyTransfer <sender> <receiver> <amount>\n"
-            "  printBlockchain\n"
-            "  printBalance\n"
-            "  failProcess"
-        )
+    def run(self):
+        print("Commands: \n moneyTransfer <from> <to> <amt>, \n printBlockchain, \n printBalance, \n failProcess, \n fixProcess")
         for line in sys.stdin:
-            line = line.strip()
-            if not line:
+            parts = line.strip().split()
+            if not parts:
                 continue
-            parts = line.split()
             cmd = parts[0]
             try:
-                if cmd == "moneyTransfer":
-                    if len(parts) != 4:
-                        print("Usage: moneyTransfer <sender> <receiver> <amount>")
-                        continue
-                    s = int(parts[1])
-                    r = int(parts[2])
-                    amt = int(parts[3])
-                    self.handle_money_transfer(s, r, amt)
+                if cmd == "moneyTransfer" and len(parts) == 4:
+                    self._transfer(int(parts[1]), int(parts[2]), int(parts[3]))
                 elif cmd == "printBlockchain":
                     self.blockchain.print_chain()
                 elif cmd == "printBalance":
                     self.print_balances()
                 elif cmd == "failProcess":
-                    print(f"[Node {self.node_id}] Failing process as requested.")
-                    self.shutdown()
+                    print(f"[Node {self.id}] Failing...")
+                    self._shutdown()
                     break
+                elif cmd == "fixProcess":
+                    self._fix()
                 else:
-                    print(f"Unknown command: {cmd}")
+                    print(f"Unknown: {cmd}")
             except Exception as e:
-                print(f"[Node {self.node_id}] Error handling command '{line}': {e}")
-
-    def print_balances(self) -> None:
+                print(f"Error: {e}")
+    
+    def print_balances(self):
         print("Balances:")
         for nid, bal in sorted(self.balances.items(), key=lambda x: int(x[0])):
             print(f"  {nid}: {bal}")
 
-    # ------------- High-level transaction entry -------------
+    def _transfer(self, sender: int, receiver: int, amount: int):
+        if sender == receiver:
+            return print("Error: sender == receiver")
+        if str(sender) not in self.balances or str(receiver) not in self.balances:
+            return print("Error: invalid account")
+        if self.balances[str(sender)] < amount:
+            return print("Error: insufficient balance")
 
-    def handle_money_transfer(self, sender_id: int, receiver_id: int, amount: int) -> None:
-        """
-        Initiate a new Paxos instance for the next block depth.
-        """
-        if sender_id == receiver_id:
-            print("[Error] Sender and receiver must be different.")
-            return
-
-        s_key = str(sender_id)
-        r_key = str(receiver_id)
-        if s_key not in self.balances or r_key not in self.balances:
-            print("[Error] Unknown account id(s).")
-            return
-
-        if self.balances[s_key] < amount:
-            print("[Error] Insufficient balance.")
-            return
-
-        depth = len(self.blockchain)
-        print(f"[Node {self.node_id}] Initiating Paxos for depth={depth} tx {sender_id}->{receiver_id}:{amount}")
-
-        tx = Transaction(sender_id=sender_id, receiver_id=receiver_id, amount=amount)
-        prev_hash = self.blockchain.last_hash()
-        block = Block.mine(index=depth, tx=tx, prev_hash=prev_hash)
+        depth = self.blockchain.height()
+        tx = Transaction(sender, receiver, amount)
+        block = Block.mine(depth, tx, self.blockchain.last_hash())
+        
+        print(f"[Node {self.id}] Proposing: {sender}->{receiver} ${amount} at depth={depth}")
 
         with self.lock:
             self.proposed_blocks[depth] = block
-            ballot = self.next_ballot(depth)
+            ballot = self._next_ballot(depth)
             self.current_ballot[depth] = ballot
             self.promises[depth] = {}
-            if depth in self.accept_phase_started:
-                self.accept_phase_started.remove(depth)
+            self.accept_started.discard(depth)
 
-        prepare_msg = {
-            "type": "PREPARE",
-            "from": self.node_id,
-            "depth": depth,
-            "ballot": list(ballot),
-        }
-        self.broadcast(prepare_msg)
+        self.broadcast({"type": "PREPARE", "from": self.id, "depth": depth, "ballot": list(ballot)})
 
-    # ------------- Message dispatch -------------
-
-    def handle_message(self, msg: Dict[str, Any]) -> None:
-        mtype = msg.get("type")
-        if mtype == "PREPARE":
-            self.handle_prepare(msg)
-        elif mtype == "PROMISE":
-            self.handle_promise(msg)
-        elif mtype == "ACCEPT":
-            self.handle_accept(msg)
-        elif mtype == "ACCEPTED":
-            self.handle_accepted(msg)
-        elif mtype == "DECIDE":
-            self.handle_decide(msg)
-        else:
-            print(f"[Node {self.node_id}] Unknown message type: {mtype}")
-
-    # ------------- Paxos roles -------------
-
-    def handle_prepare(self, msg: Dict[str, Any]) -> None:
-        depth = int(msg["depth"])
-        ballot = tuple(msg["ballot"])
-        sender = int(msg["from"])
-
-        with self.lock:
-            st = self.get_paxos_state(depth)
-            if st.promised_n is None or compare_ballot(ballot, st.promised_n) >= 0:
-                st.promised_n = ballot
-                resp: Dict[str, Any] = {
-                    "type": "PROMISE",
-                    "from": self.node_id,
-                    "to": sender,
-                    "depth": depth,
-                    "ballot": list(ballot),
-                }
-                if st.accepted_n is not None and st.accepted_block is not None:
-                    resp["accepted_n"] = list(st.accepted_n)
-                    resp["accepted_block"] = st.accepted_block.to_dict()
-            else:
-                # Ignore lower ballot
-                return
-
-        self.send_to_node(sender, resp)
-
-    def handle_promise(self, msg: Dict[str, Any]) -> None:
-        depth = int(msg["depth"])
-        ballot = tuple(msg["ballot"])
-        sender = int(msg["from"])
-
-        with self.lock:
-            cur_ballot = self.current_ballot.get(depth)
-            if cur_ballot is None or cur_ballot != ballot:
-                return
-
-            prom_dict = self.promises.setdefault(depth, {})
-            accepted_n = None
-            accepted_block = None
-            if "accepted_n" in msg and "accepted_block" in msg:
-                accepted_n = tuple(msg["accepted_n"])
-                accepted_block = Block.from_dict(msg["accepted_block"])
-            prom_dict[sender] = (accepted_n, accepted_block)
-
-            if depth in self.accept_phase_started:
-                return
-
-            if len(prom_dict) < self.majority:
-                return
-
-            # Choose value to propose according to Paxos rule.
-            best_n: Optional[Tuple[int, int, int]] = None
-            best_block: Optional[Block] = None
-            for acc_n, acc_block in prom_dict.values():
-                if acc_n is not None and acc_block is not None:
-                    if best_n is None or compare_ballot(acc_n, best_n) > 0:
-                        best_n = acc_n
-                        best_block = acc_block
-
-            if best_block is None:
-                best_block = self.proposed_blocks.get(depth)
-                if best_block is None:
-                    return
-
-            self.accept_phase_started.add(depth)
-            acc_msg = {
-                "type": "ACCEPT",
-                "from": self.node_id,
-                "depth": depth,
-                "ballot": list(ballot),
-                "block": best_block.to_dict(),
-            }
-
-        self.broadcast(acc_msg)
-
-    def handle_accept(self, msg: Dict[str, Any]) -> None:
-        depth = int(msg["depth"])
-        ballot = tuple(msg["ballot"])
-        block_dict = msg["block"]
-        block = Block.from_dict(block_dict)
-
-        with self.lock:
-            st = self.get_paxos_state(depth)
-            if st.promised_n is None or compare_ballot(ballot, st.promised_n) >= 0:
-                st.promised_n = ballot
-                st.accepted_n = ballot
-                st.accepted_block = block
-            else:
-                return
-
-        accepted_msg = {
-            "type": "ACCEPTED",
-            "from": self.node_id,
-            "depth": depth,
-            "ballot": list(ballot),
-            "block": block.to_dict(),
-        }
-        self.broadcast(accepted_msg)
-
-    def handle_accepted(self, msg: Dict[str, Any]) -> None:
-        depth = int(msg["depth"])
-        ballot = tuple(msg["ballot"])
-
-        key = (depth, ballot)
-
-        with self.lock:
-            current = self.accepted_counts.get(key, 0) + 1
-            self.accepted_counts[key] = current
-
-            _, leader_id, _ = ballot
-            if self.node_id != leader_id:
-                return
-
-            if depth in self.decided_depths:
-                return
-
-            if current < self.majority:
-                return
-
-            block_dict = msg.get("block")
-            if block_dict is None:
-                return
-            block = Block.from_dict(block_dict)
-
-            print(f"[Node {self.node_id}] DECISION READY at depth={depth}")
-            self.decided_depths.add(depth)
-
-            self.mark_block_decided_and_apply(depth, block)
-
-            decide_msg = {
-                "type": "DECIDE",
-                "from": self.node_id,
-                "depth": depth,
-                "block": block.to_dict(),
-            }
-
-        print(f"[Node {self.node_id}] Broadcasting DECIDE depth={depth}")
-        self.broadcast(decide_msg)
-
-    def handle_decide(self, msg: Dict[str, Any]) -> None:
-        depth = int(msg["depth"])
-        block = Block.from_dict(msg["block"])
-        print(f"[Node {self.node_id}] DECIDE received for depth={depth}")
-        with self.lock:
-            if depth in self.decided_depths:
-                return
-            self.decided_depths.add(depth)
-            self.mark_block_decided_and_apply(depth, block)
-
-    # ------------- Commit / balances -------------
-
-    def mark_block_decided_and_apply(self, depth: int, block: Block) -> None:
-        """
-        Integrate a decided block into the local blockchain and recompute balances.
-        """
-        block.tentative = False
-        self.blockchain.ensure_block_at_depth(depth, block)
-
-        new_balances: Dict[str, int] = {}
-        for nid in self.balances.keys():
-            new_balances[nid] = 100
-
-        for b in self.blockchain.blocks:
-            if not b.tentative:
-                apply_decided_block_to_balances(b, new_balances)
-
-        self.balances = new_balances
-        save_balances(self.node_id, self.balances)
-        save_blockchain(self.node_id, self.blockchain)
-
-    # ------------- Shutdown -------------
-
-    def shutdown(self) -> None:
+    def _shutdown(self):
+        self._save_state()
         self.running = False
-        if self.server_socket is not None:
-            try:
-                self.server_socket.close()
-            except OSError:
-                pass
+        if self.sock:
+            self.sock.close()
+
+    def _fix(self):
+        print(f"[Node {self.id}] Fixing - reloading state...")
+        self.blockchain = load_blockchain(self.id)
+        self.balances = load_balances(self.id)
+        self._restore_state()
+        
+        if not self.running:
+            self.running = True
+            self.start()
+        
+        print(f"[Node {self.id}] Fixed! depth={self.blockchain.height()}")
+        # Sync with random node
+        other = [n["id"] for n in self.nodes if n["id"] != self.id]
+        if other:
+            self.send(random.choice(other), {"type": "SYNC_REQ", "from": self.id, 
+                                             "my_depth": self.blockchain.height()})
 
 
-def main() -> None:
+def main():
     if len(sys.argv) != 2:
         print("Usage: python node.py <node_id>")
         sys.exit(1)
-    node_id = int(sys.argv[1])
-    node = Node(node_id)
-    node.start_listener_thread()
-    node.command_loop()
+    node = Node(int(sys.argv[1]))
+    node.start()
+    node.run()
 
 
 if __name__ == "__main__":
