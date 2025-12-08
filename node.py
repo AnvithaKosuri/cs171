@@ -395,7 +395,12 @@ class Node:
     # ==================== Commands ====================
 
     def run(self):
-        print("Commands: \n moneyTransfer <from> <to> <amt>, \n printBlockchain, \n printBalance, \n failProcess, \n fixProcess")
+        print("Commands:\n"
+              "  moneyTransfer <sender> <receiver> <amount>\n"
+              "  printBlockchain\n"
+              "  printBalance\n"
+              "  failProcess\n"
+              "  fixProcess")
         for line in sys.stdin:
             parts = line.strip().split()
             if not parts:
@@ -425,6 +430,9 @@ class Node:
             print(f"  {nid}: {bal}")
 
     def _transfer(self, sender: int, receiver: int, amount: int):
+        # Per spec: sender must be this node
+        if sender != self.id:
+            return print(f"Error: sender must be this node ({self.id})")
         if sender == receiver:
             return print("Error: sender == receiver")
         if str(sender) not in self.balances or str(receiver) not in self.balances:
